@@ -1708,7 +1708,7 @@ public class DataQueryParams
         }
         else
         {
-            checkForIndicatorCyclicReference(item);
+            checkForIndicatorCyclicReference( item );
         }
     }
 
