@@ -51,7 +51,7 @@ jobs:
           docker push $DOCKER_CHANNEL:$PR_NUMBER
 
       - name: Build test image
-        uses: docker/build-push-action@v3
+        uses: docker/build-push-action@v4
         with:
           context: dhis-2/dhis-e2e-test
           push: false
