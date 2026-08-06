@@ -32,10 +32,13 @@ package org.hisp.dhis.config;
 import static org.hisp.dhis.external.conf.ConfigurationKey.CACHE_EHCACHE_CONFIG_FILE;
 import static org.hisp.dhis.external.conf.ConfigurationKey.USE_QUERY_CACHE;
 import static org.hisp.dhis.external.conf.ConfigurationKey.USE_SECOND_LEVEL_CACHE;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -43,6 +46,7 @@ import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -52,12 +56,18 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import javax.cache.CacheManager;
 import javax.cache.Caching;
 import org.ehcache.config.CacheRuntimeConfiguration;
 import org.ehcache.config.ResourceType;
 import org.ehcache.config.SizedResourcePool;
 import org.ehcache.jsr107.Eh107Configuration;
+import org.hibernate.CacheMode;
 import org.hibernate.Session;
 import org.hibernate.SessionFactory;
 import org.hibernate.Transaction;
@@ -66,6 +76,8 @@ import org.hibernate.boot.registry.StandardServiceRegistryBuilder;
 import org.hibernate.cache.internal.NoCachingRegionFactory;
 import org.hibernate.cache.jcache.internal.JCacheRegionFactory;
 import org.hibernate.cache.spi.RegionFactory;
+import org.hibernate.cache.spi.access.EntityDataAccess;
+import org.hibernate.cache.spi.support.AbstractReadWriteAccess;
 import org.hibernate.cfg.AvailableSettings;
 import org.hibernate.engine.spi.SessionFactoryImplementor;
 import org.hibernate.resource.jdbc.spi.StatementInspector;
@@ -77,6 +89,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
@@ -433,6 +446,255 @@ class HibernateCacheEffectTest {
   }
 
   // -------------------------------------------------------------------------
+  // Mechanism pinning (Phase 4.0): minimal-puts, per-strategy behavior, region lock
+  // -------------------------------------------------------------------------
+
+  /**
+   * Pins that {@code hibernate.cache.use_minimal_puts} is a NO-OP in this stack: Hibernate's
+   * TwoPhaseLoad passes the flag down as {@code minimalPutOverride}, but both {@code
+   * AbstractReadWriteAccess#putFromLoad} (final) and {@code
+   * AbstractCachedDomainDataAccess#putFromLoad} discard it in Hibernate 5.6, and the JCache storage
+   * access has no contains-check either, so enabling the setting changes nothing. The
+   * NONSTRICT_READ_WRITE entity is used because its access strategy re-puts on every query load,
+   * which is exactly the redundant write minimal-puts exists to prevent: with a working
+   * minimal-puts implementation the {@code true} case would put 0 times. If this test starts
+   * failing for {@code minimalPuts=true} after a Hibernate upgrade, the put storm has gained a
+   * config-only fix and the setting deserves a ConfigurationKey.
+   */
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void minimalPutsSettingHasNoEffectOnQueryLoadRePuts(boolean minimalPuts)
+      throws ReflectiveOperationException {
+    Properties overrides = new Properties();
+    overrides.put(AvailableSettings.USE_MINIMAL_PUTS, String.valueOf(minimalPuts));
+    sessionFactory = buildSessionFactory(dhisConfig("true", "false", ""), overrides);
+    persistEntityOfType(NonstrictCachedTestEntity.class);
+    sessionFactory.getCache().evictAllRegions();
+    loadByIdInNewSession(NonstrictCachedTestEntity.class); // warm the entity region
+
+    Statistics statistics = sessionFactory.getStatistics();
+    statistics.clear();
+    queryAllInNewSession(NonstrictCachedTestEntity.class);
+    queryAllInNewSession(NonstrictCachedTestEntity.class);
+
+    assertEquals(
+        0,
+        statistics.getSecondLevelCacheHitCount(),
+        "query hydration must not read the second level cache");
+    assertEquals(
+        2,
+        statistics.getSecondLevelCachePutCount(),
+        "every query load must re-put the already cached entity; minimal-puts has no effect");
+  }
+
+  /**
+   * Pins what a query load of an ALREADY CACHED, unchanged entity costs per concurrency strategy.
+   * DHIS2 entities are not versioned, so under READ_WRITE the existing unlocked cache entry is
+   * never "writeable" ({@code Item#isWriteable} requires a version) and the redundant data write is
+   * skipped - but only AFTER taking the region-wide WRITE lock (see {@link
+   * #queryLoadOfUnchangedCachedEntityStillTakesTheRegionWriteLock()}): a lock storm without data
+   * writes. NONSTRICT_READ_WRITE and READ_ONLY have no region lock but re-put the identical value
+   * on every query load - a redundant store-by-value serialization per row instead. Only
+   * CacheMode.GET avoids both.
+   */
+  @ParameterizedTest
+  @CsvSource({
+    "org.hisp.dhis.config.CachedTestEntity, 0",
+    "org.hisp.dhis.config.NonstrictCachedTestEntity, 1",
+    "org.hisp.dhis.config.ReadOnlyCachedTestEntity, 1"
+  })
+  void queryLoadOfCachedEntityCostsPutsPerStrategy(Class<?> entityClass, int expectedPuts)
+      throws ReflectiveOperationException {
+    sessionFactory = buildSessionFactory(dhisConfig("true", "false", ""));
+    persistEntityOfType(entityClass);
+    sessionFactory.getCache().evictAllRegions();
+    loadByIdInNewSession(entityClass); // warm the entity region
+
+    Statistics statistics = sessionFactory.getStatistics();
+    statistics.clear();
+    queryAllInNewSession(entityClass);
+
+    CacheRegionStatistics regionStatistics =
+        statistics.getDomainDataRegionStatistics(entityClass.getName());
+    assertNotNull(regionStatistics);
+    assertEquals(
+        expectedPuts,
+        regionStatistics.getPutCount(),
+        "unexpected cache put count for a query load of an already cached entity");
+  }
+
+  /**
+   * The READ_WRITE flip side of {@link #queryLoadOfCachedEntityCostsPutsPerStrategy(Class, int)}:
+   * skipping the redundant data write does NOT skip the region WRITE lock. Every query-hydrated row
+   * enters {@code AbstractReadWriteAccess#putFromLoad}, which takes the region-wide write lock
+   * BEFORE deciding the entry is not writeable. The test holds the region READ lock and proves a
+   * concurrent query load of an unchanged, already cached entity parks on the write lock, then
+   * completes without having put anything - the pure lock-storm cost that Phase 3 measured as
+   * parked-in-AbstractReadWriteAccess wall time.
+   */
+  @Test
+  void queryLoadOfUnchangedCachedEntityStillTakesTheRegionWriteLock() throws Exception {
+    sessionFactory = buildSessionFactory(dhisConfig("true", "false", ""));
+    persistEntity();
+    sessionFactory.getCache().evictAllRegions();
+    loadEntityInNewSession(); // warm the entity region
+
+    AbstractReadWriteAccess access =
+        assertInstanceOf(AbstractReadWriteAccess.class, cacheAccess(CachedTestEntity.class));
+    ReentrantReadWriteLock regionLock = regionLock(access);
+
+    Statistics statistics = sessionFactory.getStatistics();
+    statistics.clear();
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    try {
+      Future<?> queryLoad;
+      regionLock.readLock().lock();
+      try {
+        queryLoad = executor.submit(() -> queryEntitiesInNewSession());
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!regionLock.hasQueuedThreads() && System.nanoTime() < deadline) {
+          Thread.sleep(1);
+        }
+        assertTrue(
+            regionLock.hasQueuedThreads(),
+            "the query load must park on the region write lock even though it will not write");
+        assertFalse(queryLoad.isDone(), "the query load must be parked, not finished or failed");
+      } finally {
+        regionLock.readLock().unlock();
+      }
+      assertDoesNotThrow(
+          () -> queryLoad.get(10, TimeUnit.SECONDS),
+          "the query load must complete once the region lock is released");
+    } finally {
+      executor.shutdownNow();
+    }
+    assertEquals(
+        0,
+        statistics.getSecondLevelCachePutCount(),
+        "the write lock was taken without any data being written");
+  }
+
+  /**
+   * CacheMode.GET reads the cache but never puts: the surgical per-path fix for query-load put
+   * storms (e.g. import transactions re-putting Option/DataElement entries they did not change).
+   */
+  @Test
+  void cacheModeGetReadsTheCacheButNeverPuts() {
+    sessionFactory = buildSessionFactory(dhisConfig("true", "false", ""));
+    persistEntity();
+    sessionFactory.getCache().evictAllRegions();
+    loadEntityInNewSession(); // warm the entity region
+
+    Statistics statistics = sessionFactory.getStatistics();
+    statistics.clear();
+    try (Session session = sessionFactory.openSession()) {
+      session.setCacheMode(CacheMode.GET);
+      assertNotNull(session.get(CachedTestEntity.class, 1L));
+    }
+    assertEquals(1, statistics.getSecondLevelCacheHitCount(), "GET mode must still read the cache");
+    assertEquals(
+        0, statistics.getSecondLevelCachePutCount(), "GET mode must never write the cache");
+
+    statistics.clear();
+    try (Session session = sessionFactory.openSession()) {
+      session.setCacheMode(CacheMode.GET);
+      assertEquals(
+          1,
+          session
+              .createQuery("from CachedTestEntity", CachedTestEntity.class)
+              .getResultList()
+              .size());
+    }
+    assertEquals(
+        0,
+        statistics.getSecondLevelCachePutCount(),
+        "a GET mode query load must not re-put the already cached entity");
+  }
+
+  /**
+   * READ_ONLY rejects runtime updates: converting a region to READ_ONLY turns writes to its
+   * entities into hard failures instead of staleness windows, so it is only safe for reference data
+   * that is never updated while serving load.
+   */
+  @Test
+  void readOnlyStrategyRejectsUpdates() throws ReflectiveOperationException {
+    sessionFactory = buildSessionFactory(dhisConfig("true", "false", ""));
+    persistEntityOfType(ReadOnlyCachedTestEntity.class);
+
+    try (Session session = sessionFactory.openSession()) {
+      Transaction transaction = session.beginTransaction();
+      ReadOnlyCachedTestEntity entity = session.get(ReadOnlyCachedTestEntity.class, 1L);
+      assertNotNull(entity);
+      entity.setName("updated");
+      RuntimeException ex = assertThrows(RuntimeException.class, transaction::commit);
+      assertTrue(
+          causeChainContains(ex, UnsupportedOperationException.class),
+          "updating a READ_ONLY cached entity must be rejected: " + ex);
+    }
+  }
+
+  /** Pins the lock surface per strategy: only READ_WRITE carries the per-region lock (F3). */
+  @Test
+  void onlyReadWriteAccessCarriesTheRegionLock() {
+    sessionFactory = buildSessionFactory(dhisConfig("true", "false", ""));
+
+    assertInstanceOf(
+        AbstractReadWriteAccess.class,
+        cacheAccess(CachedTestEntity.class),
+        "READ_WRITE must use the region-lock carrying access strategy");
+    assertFalse(
+        cacheAccess(NonstrictCachedTestEntity.class) instanceof AbstractReadWriteAccess,
+        "NONSTRICT_READ_WRITE must not carry the region lock");
+    assertFalse(
+        cacheAccess(ReadOnlyCachedTestEntity.class) instanceof AbstractReadWriteAccess,
+        "READ_ONLY must not carry the region lock");
+  }
+
+  /**
+   * Encodes F3 mechanically: the READ_WRITE access strategy serializes all cache operations of a
+   * region through one ReentrantReadWriteLock, so while any thread holds the region WRITE lock
+   * (putFromLoad, lockItem, unlockItem) every concurrent reader parks. This is the convoy mechanism
+   * measured under load in Phase 3 (8.4-14.4% of JVM wall samples parked in
+   * AbstractReadWriteAccess). The test holds the region write lock directly and proves a concurrent
+   * cache read queues on it, then completes once released.
+   */
+  @Test
+  void readWriteRegionWriteLockBlocksConcurrentCacheReads() throws Exception {
+    sessionFactory = buildSessionFactory(dhisConfig("true", "false", ""));
+    persistEntity();
+    loadEntityInNewSession(); // warm the entity region
+
+    AbstractReadWriteAccess access =
+        assertInstanceOf(AbstractReadWriteAccess.class, cacheAccess(CachedTestEntity.class));
+    ReentrantReadWriteLock regionLock = regionLock(access);
+
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    try {
+      Future<?> reader;
+      regionLock.writeLock().lock();
+      try {
+        reader = executor.submit(this::loadEntityInNewSession);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!regionLock.hasQueuedThreads() && System.nanoTime() < deadline) {
+          Thread.sleep(1);
+        }
+        assertTrue(
+            regionLock.hasQueuedThreads(),
+            "a concurrent cache read must queue on the region lock while the write lock is"
+                + " held");
+        assertFalse(reader.isDone(), "the reader must be parked, not finished or failed");
+      } finally {
+        regionLock.writeLock().unlock();
+      }
+      assertDoesNotThrow(
+          () -> reader.get(10, TimeUnit.SECONDS),
+          "the parked reader must complete once the region write lock is released");
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Test plumbing
   // -------------------------------------------------------------------------
 
@@ -447,7 +709,13 @@ class HibernateCacheEffectTest {
   }
 
   private SessionFactory buildSessionFactory(DhisConfigurationProvider dhisConfig) {
+    return buildSessionFactory(dhisConfig, new Properties());
+  }
+
+  private SessionFactory buildSessionFactory(
+      DhisConfigurationProvider dhisConfig, Properties overrides) {
     Properties properties = HibernateConfig.getAdditionalProperties(dhisConfig);
+    properties.putAll(overrides);
 
     StandardServiceRegistryBuilder registryBuilder = new StandardServiceRegistryBuilder();
     properties.forEach((key, value) -> registryBuilder.applySetting((String) key, value));
@@ -466,6 +734,8 @@ class HibernateCacheEffectTest {
     return new MetadataSources(registryBuilder.build())
         .addAnnotatedClass(CachedTestEntity.class)
         .addAnnotatedClass(CachedParentTestEntity.class)
+        .addAnnotatedClass(NonstrictCachedTestEntity.class)
+        .addAnnotatedClass(ReadOnlyCachedTestEntity.class)
         .buildMetadata()
         .buildSessionFactory();
   }
@@ -544,6 +814,58 @@ class HibernateCacheEffectTest {
   private void loadEntityInNewSession() {
     try (Session session = sessionFactory.openSession()) {
       assertNotNull(session.get(CachedTestEntity.class, 1L));
+    }
+  }
+
+  private EntityDataAccess cacheAccess(Class<?> entityClass) {
+    return ((SessionFactoryImplementor) sessionFactory)
+        .getMetamodel()
+        .entityPersister(entityClass.getName())
+        .getCacheAccessStrategy();
+  }
+
+  private static ReentrantReadWriteLock regionLock(AbstractReadWriteAccess access)
+      throws ReflectiveOperationException {
+    Field lockField = AbstractReadWriteAccess.class.getDeclaredField("reentrantReadWriteLock");
+    lockField.setAccessible(true);
+    return (ReentrantReadWriteLock) lockField.get(access);
+  }
+
+  private static boolean causeChainContains(Throwable throwable, Class<? extends Throwable> type) {
+    for (Throwable cause = throwable; cause != null; cause = cause.getCause()) {
+      if (type.isInstance(cause)) {
+        return true;
+      }
+      if (cause.getCause() == cause) {
+        break;
+      }
+    }
+    return false;
+  }
+
+  private void persistEntityOfType(Class<?> entityClass) throws ReflectiveOperationException {
+    try (Session session = sessionFactory.openSession()) {
+      Transaction transaction = session.beginTransaction();
+      session.persist(
+          entityClass.getConstructor(Long.class, String.class).newInstance(1L, "cached"));
+      transaction.commit();
+    }
+  }
+
+  private void loadByIdInNewSession(Class<?> entityClass) {
+    try (Session session = sessionFactory.openSession()) {
+      assertNotNull(session.get(entityClass, 1L));
+    }
+  }
+
+  private void queryAllInNewSession(Class<?> entityClass) {
+    try (Session session = sessionFactory.openSession()) {
+      assertEquals(
+          1,
+          session
+              .createQuery("from " + entityClass.getSimpleName(), entityClass)
+              .getResultList()
+              .size());
     }
   }
 
